@@ -1774,8 +1774,13 @@ class LMCacheMPWorkerAdapter:
 
         return True
 
-    def create_recorded_event(self) -> _IpcEvent | None:
+    def create_recorded_event(self, stream: Any | None = None) -> _IpcEvent | None:
         """Create the ordering event required by the active transfer context.
+
+        Args:
+            stream: Stream that produced the KV this event orders. When
+                omitted the transfer context records on the calling thread's
+                current stream.
 
         Returns:
             A recorded event for contexts that need stream ordering, or
@@ -1793,7 +1798,7 @@ class LMCacheMPWorkerAdapter:
             )
         if not self.is_healthy:
             return None
-        return transfer_ctx.create_recorded_event()
+        return transfer_ctx.create_recorded_event(stream=stream)
 
     @_lmcache_nvtx_annotate
     def submit_store_request(

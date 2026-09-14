@@ -104,6 +104,16 @@ class RequestClient(Protocol):
     ) -> MessagingFuture[tuple[bytes, bool]]: ...
 
     @rpc_method
+    def release_event(self, event_ipc_handle: bytes) -> MessagingFuture[None]:
+        """Tell the server the worker is done with an exported completion event.
+
+        The reply is the server's acknowledgement that the event returned to
+        its pool; the worker only needs to send it once its device side is
+        done with the handle (see ``DeviceMessagingFuture._finish_device``).
+        """
+        ...
+
+    @rpc_method
     def lookup(self, key: IPCCacheServerKey, tp_size: int) -> MessagingFuture[None]: ...
 
     @rpc_method

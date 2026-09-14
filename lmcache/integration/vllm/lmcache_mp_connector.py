@@ -52,6 +52,7 @@ import torch
 import zmq
 
 # First Party
+from lmcache import torch_dev
 from lmcache.banner import print_banner_once
 from lmcache.integration.vllm.experimental import dispatch
 from lmcache.integration.vllm.kv_cache_group_edits import (
@@ -134,6 +135,21 @@ logger = lmcache_init_logger(__name__)
 
 _DCP_LAYOUT_NAMESPACE = "##lmcache-dcp-layout-v1-"
 _MAX_LCM_EXPANSION_FACTOR = 4
+
+
+def _stream_handle(stream: Any) -> int | None:
+    """Return the raw device stream handle, for identity comparison.
+
+    ``torch.cuda.current_stream()`` may hand back a fresh wrapper object for
+    the same underlying stream, so comparing the wrappers is not reliable.
+
+    Args:
+        stream: A torch/cupy stream wrapper.
+
+    Returns:
+        The raw stream handle when the wrapper exposes one, else ``None``.
+    """
+    return getattr(stream, "cuda_stream", None)
 
 
 def _convert_kv_event_hash(block_hash: bytes | int | None) -> bytes | int | None:
@@ -795,6 +811,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # groups report 0 and take no part in caching. Falls back to
         # the engine's base block size when no group metadata is available
         # (single non-hybrid group).
+        # Stream that produced this step's KV. `start_load_kv` and
+        # `wait_for_save` must record their producer events on it; a mismatch
+        # means a hook moved to another thread/stream.
+        self._load_stream: Any | None = None
+
         self._group_tokens_per_block = group_tokens_per_block
         cached_spans = [span for span in group_tokens_per_block if span > 0]
         if not cached_spans or min(group_tokens_per_block) < 0:
@@ -927,7 +948,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if len(request_ids) == 0:
             return
 
-        event = self.worker_adapter.create_recorded_event()
+        stream = torch_dev.current_stream()
+        self._load_stream = stream
+        event = self.worker_adapter.create_recorded_event(stream=stream)
 
         self.worker_adapter.batched_submit_retrieve_requests(
             request_ids,
@@ -1008,7 +1031,20 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 dispatch(self.dispatcher, "wait_for_save", event=None)
             return
 
-        event = self.worker_adapter.create_recorded_event()
+        stream = torch_dev.current_stream()
+        if (
+            self._load_stream is not None
+            and _stream_handle(stream) != _stream_handle(self._load_stream)
+        ):
+            logger.warning(
+                "KV store records its producer event on a different stream "
+                "than this step's load_kv (load=%s save=%s); the event may "
+                "never fire if the producing stream is blocked.",
+                _stream_handle(self._load_stream),
+                _stream_handle(stream),
+            )
+        self._load_stream = None
+        event = self.worker_adapter.create_recorded_event(stream=stream)
 
         self.worker_adapter.batched_submit_store_requests(
             request_ids,

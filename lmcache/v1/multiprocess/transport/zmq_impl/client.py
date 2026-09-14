@@ -52,10 +52,16 @@ class ZmqMultiprocessClient(RequestClient):
         kwargs: dict[str, Any],
     ) -> MessagingFuture[Any] | MessagingStream[Any]:
         payloads = rpc_spec.bind_payloads(args, kwargs)
-        return self._message_queue_client.submit_request(
+        future = self._message_queue_client.submit_request(
             rpc_spec.operation,
             list(payloads),
         )
+        if isinstance(future, MessagingFuture):
+            # Called once the device side of a STORE/RETRIEVE reply is done,
+            # so the server can return the exported completion event to its
+            # pool on a fact instead of a count window.
+            future.release_hook = self.release_event
+        return future
 
 
 def _make_client_rpc_method(rpc_spec: RpcSpec) -> ClientRpcCallable:

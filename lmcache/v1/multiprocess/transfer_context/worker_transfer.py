@@ -543,11 +543,17 @@ class LMCacheDrivenTransferContext(TransferContext):
         self._event_backend = event_backend
         self._mq_timeout = mq_timeout
 
-    def create_recorded_event(self) -> IPCEvent:
+    def create_recorded_event(self, stream: Any | None = None) -> IPCEvent:
         """Create and record an exportable event for handle-based transfer.
 
+        Args:
+            stream: Stream that produced the KV this event orders. Pass it
+                explicitly from the connector hook so the record can never
+                land on a different (e.g. dispatcher-thread) stream. ``None``
+                falls back to the calling thread's current stream.
+
         Returns:
-            An interprocess-capable event recorded on the current stream.
+            An interprocess-capable event recorded on ``stream``.
 
         Raises:
             RuntimeError: If :meth:`register` has not completed.
@@ -558,7 +564,9 @@ class LMCacheDrivenTransferContext(TransferContext):
                 "Call register() before creating transfer events."
             )
         event = self._event_backend.create_event(self._device)
-        self._event_backend.record_event(event, torch_dev.current_stream())
+        self._event_backend.record_event(
+            event, stream if stream is not None else torch_dev.current_stream()
+        )
         return cast(IPCEvent, event)
 
     def unregister(self) -> MessagingFuture[Any] | None:
@@ -628,9 +636,14 @@ class LMCacheDrivenTransferContext(TransferContext):
         if event is None:
             raise RuntimeError("LMCache-driven transfer requires an IPC event.")
         event_ipc_handle = self._event_backend.export_event(event, self._device)
-        future = self._req_client.store(
+        raw_future = self._req_client.store(
             key, self._instance_id, block_ids, event_ipc_handle
-        ).to_device_future(
+        )
+        # The server replies only after importing this handle, so the reply
+        # future is the import ACK: pin the event (and its underlying CUDA
+        # object) to the transport-held future instead of a count window.
+        raw_future.retain_reference(event)
+        future = raw_future.to_device_future(
             device=self._device,
             event_backend=self._event_backend,
         )
@@ -656,9 +669,11 @@ class LMCacheDrivenTransferContext(TransferContext):
                 "Call register() before submit_q_store()."
             )
         event_ipc_handle = self._event_backend.export_event(event, self._device)
-        return self._req_client.store_q(
+        raw_future = self._req_client.store_q(
             key, self._instance_id, block_ids, event_ipc_handle
-        ).to_device_future(
+        )
+        raw_future.retain_reference(event)
+        return raw_future.to_device_future(
             device=self._device,
             event_backend=self._event_backend,
         )
@@ -700,13 +715,15 @@ class LMCacheDrivenTransferContext(TransferContext):
         if event is None:
             raise RuntimeError("LMCache-driven transfer requires an IPC event.")
         event_ipc_handle = self._event_backend.export_event(event, self._device)
-        return self._req_client.retrieve(
+        raw_future = self._req_client.retrieve(
             key,
             self._instance_id,
             block_ids,
             event_ipc_handle,
             skip_first_n_tokens,
-        ).to_device_future(
+        )
+        raw_future.retain_reference(event)
+        return raw_future.to_device_future(
             device=self._device,
             event_backend=self._event_backend,
         )

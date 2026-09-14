@@ -62,6 +62,9 @@ class MessagingFuture(Generic[T]):
         self.result_: T | None = None
         self.exception_: BaseException | None = None
         self._retained_references: list[object] = []
+        # Set by the request client: tells the server the worker is done with
+        # the completion event whose handle this future's reply carried.
+        self.release_hook: Callable[[bytes], object] | None = None
 
     def query(self) -> bool:
         """
@@ -234,7 +237,10 @@ class DeviceMessagingFuture(MessagingFuture[T]):
         self.raw_future_ = raw_future
         self.event_: Any | None = None
         self.result_: T | None = None
+        self._event_bytes = b""
         self._raw_response_processed = False
+        self._device_done = False
+        self._lock = threading.Lock()
         self.device_ = device if device is not None else torch_dev.current_device()
         if event_backend is None:
             event_backend = get_event_ipc_backend(self.device_)
@@ -242,20 +248,36 @@ class DeviceMessagingFuture(MessagingFuture[T]):
         self._event_backend = event_backend
 
     def _on_raw_future_complete(self) -> None:
-        """
-        Update the device event and result when the raw future is complete.
+        """Import the completion event once the raw reply is in.
+
+        The caller holds ``_lock`` so the handle is imported exactly once.
         """
         if self._raw_response_processed:
             return
 
         event_bytes, result = self.raw_future_.result()
-        event = None
         if event_bytes:
-            event = self._event_backend.import_event(event_bytes, self.device_)
-
+            self.event_ = self._event_backend.import_event(
+                event_bytes, self.device_
+            )
+        self._event_bytes = event_bytes
         self.result_ = result
-        self.event_ = event
         self._raw_response_processed = True
+
+    def _finish_device(self) -> None:
+        """Mark the device side done, drop the import, and release the
+        exporter's event.
+
+        The caller holds ``_lock``; runs at most once. Releasing on this fact
+        (the device side finished) is what lets the exporter return the
+        completion event to its pool instead of guessing from a count window.
+        """
+        if self._device_done:
+            return
+        self._device_done = True
+        event, self.event_ = self.event_, None
+        if event is not None and self.raw_future_.release_hook is not None:
+            self.raw_future_.release_hook(self._event_bytes)
 
     def _prepare(self, timeout: Optional[float] = None) -> T:
         """Import the remote completion event without waiting for it.
@@ -276,15 +298,14 @@ class DeviceMessagingFuture(MessagingFuture[T]):
             returned its completion-event handle. It does not synchronize that
             event on the CPU.
         """
-        if not self._raw_response_processed:
-            if not self.raw_future_.wait(timeout):
-                raise LMCacheTimeoutError(
-                    "DeviceMessagingFuture raw result not available within timeout"
-                )
+        if not self.raw_future_.wait(timeout):
+            raise LMCacheTimeoutError(
+                "DeviceMessagingFuture raw result not available within timeout"
+            )
+        with self._lock:
             self._on_raw_future_complete()
-
-        assert self.result_ is not None
-        return self.result_
+            assert self.result_ is not None
+            return self.result_
 
     def wait_on_stream(self, stream: Any, timeout: Optional[float] = None) -> T:
         """Make ``stream`` wait for remote device work without blocking the CPU.
@@ -309,6 +330,10 @@ class DeviceMessagingFuture(MessagingFuture[T]):
         result = self._prepare(timeout)
         if self.event_ is not None:
             self._event_backend.wait_event(self.event_, stream)
+        # NOTE: the wait is only *enqueued* here, so the device side is not
+        # done yet and the export must not be released. Callers that use this
+        # fire-and-forget path keep the server's event held until the context
+        # is unregistered; the vLLM connector uses result()/wait() instead.
         return result
 
     def wait(self, timeout: Optional[float] = None) -> bool:
@@ -327,20 +352,16 @@ class DeviceMessagingFuture(MessagingFuture[T]):
         Notes:
             This function does not support waiting for a specific time.
         """
-        if self._raw_response_processed:
-            if self.event_ is not None:
-                self._event_backend.synchronize_event(self.event_, self.device_)
-            return True
-
-        flag = self.raw_future_.wait(timeout)
-        if not flag:
+        if not self.raw_future_.wait(timeout):
             return False
 
-        self._on_raw_future_complete()
-
-        if self.event_ is not None:
-            self._event_backend.synchronize_event(self.event_, self.device_)
-
+        with self._lock:
+            self._on_raw_future_complete()
+            event = None if self._device_done else self.event_
+        if event is not None:
+            self._event_backend.synchronize_event(event, self.device_)
+        with self._lock:
+            self._finish_device()
         return True
 
     def result(self, timeout: Optional[float] = None) -> T:
@@ -375,18 +396,19 @@ class DeviceMessagingFuture(MessagingFuture[T]):
         Returns:
             bool: True if the future is done, False otherwise.
         """
-        if self._raw_response_processed:
-            if self.event_ is None:
+        with self._lock:
+            if not self._raw_response_processed:
+                if not self.raw_future_.query():
+                    return False
+                self._on_raw_future_complete()
+            if self._device_done:
                 return True
-            return self._event_backend.query_event(self.event_)
-
-        if self.raw_future_.query():
-            self._on_raw_future_complete()
-            if self.event_ is None:
-                return True
-            return self._event_backend.query_event(self.event_)
-
-        return False
+            if self.event_ is not None and not self._event_backend.query_event(
+                self.event_
+            ):
+                return False
+            self._finish_device()
+            return True
 
     def set_result(self, result: T) -> None:
         raise NotImplementedError(
