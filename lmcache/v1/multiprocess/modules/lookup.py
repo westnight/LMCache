@@ -2,7 +2,7 @@
 """LookupModule: lookup, prefetch polling, and session lifecycle."""
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 import threading
 import time
@@ -93,6 +93,9 @@ class _PrefetchJob:
     requested_tokens: int
     num_object_groups: int = 1
     attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
+    # First chunk of the looked-up range (``key.start``); chunks below it are
+    # engine-covered and skipped, so the status offsets hits back to absolute.
+    start_chunk: int = 0
     # Captured at lookup time so the ``MP_LOOKUP_PREFETCH_END`` event can
     # carry them as labels.  ``model_name`` lets dashboards slice hit rate
     # per model in multi-model deployments; ``cache_salt`` slices per
@@ -183,22 +186,7 @@ class LookupModule:
                 model_name,
                 world_size,
             )
-            self._register_prefetch_job(
-                _PrefetchJob(
-                    handle=PrefetchHandle(
-                        prefetch_request_id=-1,
-                        external_request_id=key.request_id,
-                        total_requested_keys=0,
-                        submit_time=time.monotonic(),
-                    ),
-                    row_windows=(),
-                    request_id=key.request_id,
-                    requested_tokens=0,
-                    model_name=model_name,
-                    cache_salt=key.cache_salt,
-                    early_exit_reason="no_gpu_context",
-                )
-            )
+            self._register_empty_prefetch_job(key, early_exit_reason="no_gpu_context")
             return
 
         num_kv_readers = key.require_num_kv_readers()
@@ -207,21 +195,8 @@ class LookupModule:
             list(key.token_ids), end=key.end
         )
         if not chunk_hashes:
-            self._register_prefetch_job(
-                _PrefetchJob(
-                    handle=PrefetchHandle(
-                        prefetch_request_id=-1,
-                        external_request_id=key.request_id,
-                        total_requested_keys=0,
-                        submit_time=time.monotonic(),
-                    ),
-                    row_windows=(),
-                    request_id=key.request_id,
-                    requested_tokens=0,
-                    model_name=model_name,
-                    cache_salt=key.cache_salt,
-                    early_exit_reason="empty_chunk_hashes",
-                )
+            self._register_empty_prefetch_job(
+                key, early_exit_reason="empty_chunk_hashes"
             )
             return
 
@@ -259,6 +234,8 @@ class LookupModule:
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.set_tokens(list(key.token_ids))
+
+        start_chunk = min(max(0, key.start // self._ctx.chunk_size), len(chunk_hashes))
         session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw))
 
         group_layout_descs = self._ctx.layout_desc_registry.find_group_layout_descs(
@@ -271,28 +248,42 @@ class LookupModule:
                 model_name,
                 world_size,
             )
-            self._register_prefetch_job(
-                _PrefetchJob(
-                    handle=PrefetchHandle(
-                        prefetch_request_id=-1,
-                        external_request_id=key.request_id,
-                        total_requested_keys=0,
-                        submit_time=time.monotonic(),
-                    ),
-                    row_windows=(),
-                    request_id=key.request_id,
-                    requested_tokens=0,
-                    model_name=model_name,
-                    cache_salt=key.cache_salt,
-                    early_exit_reason="no_group_layout_descs",
-                )
+            self._register_empty_prefetch_job(
+                key, early_exit_reason="no_group_layout_descs"
+            )
+            return
+
+        # Keep the covered prefix's recency without locking
+        # or prefetching it. Prefetch only [start, end); status offsets hits
+        # back to absolute via start_chunk.
+        if start_chunk:
+            self._ctx.storage_manager.touch_cached_keys(
+                [
+                    obj_key
+                    for group_keys in ipc_key_to_object_keys(
+                        key,
+                        chunk_hashes[:start_chunk],
+                        list(range(attn_desc.num_object_groups)),
+                    )
+                    for obj_key in group_keys
+                ]
+            )
+
+        suffix_hashes = chunk_hashes[start_chunk:]
+        if not suffix_hashes:
+            self._register_empty_prefetch_job(
+                key,
+                requested_tokens=requested_tokens,
+                num_object_groups=attn_desc.num_object_groups,
+                attn_desc=attn_desc,
+                start_chunk=start_chunk,
             )
             return
 
         spec = PrefetchTaskSpec(
             key_groups=ipc_key_to_grouped_object_keys(
                 key,
-                chunk_hashes,
+                suffix_hashes,
                 list(range(attn_desc.num_object_groups)),
                 group_layout_descs,
                 attn_desc,
@@ -311,6 +302,7 @@ class LookupModule:
                 requested_tokens=requested_tokens,
                 num_object_groups=attn_desc.num_object_groups,
                 attn_desc=attn_desc,
+                start_chunk=start_chunk,
                 model_name=model_name,
                 cache_salt=key.cache_salt,
             )
@@ -386,6 +378,7 @@ class LookupModule:
         self,
         key: IPCCacheServerKey,
         tp_size: int,
+        extra_ranges: tuple[tuple[int, int], ...] = (),
     ) -> None:
         """Release read locks acquired during lookup.
 
@@ -394,7 +387,9 @@ class LookupModule:
         ``start`` and ``end`` must be aligned to ``chunk_size``; it is the
         caller's responsibility to align the boundaries as desired.
 
-        Only the keys the prefetch actually read-locked are released.
+        Only the keys the prefetch actually read-locked are released: the
+        key's range is floored to the current lookup's ``start``, and each
+        extra range resolves against its own boundaries.
 
         Releases the same per-object count the lookup reserved
         (``key.num_kv_readers``).
@@ -408,8 +403,13 @@ class LookupModule:
         Args:
             key: Cache key whose read locks should be released.
             tp_size: Legacy wire field; ignored (kept for payload arity).
+            extra_ranges: Lock ranges left over from this request's earlier,
+                abandoned lookups, as ``(start, end)`` token pairs. Each end
+                must be that lookup's hit boundary, so the range resolves to
+                exactly the keys it locked (sliding-window groups translate
+                from the hit).
         """
-        if key.start >= key.end:
+        if key.start >= key.end and not extra_ranges:
             return
 
         session = self._ctx.session_manager.get_or_create(key.request_id)
@@ -442,13 +442,36 @@ class LookupModule:
                 key.request_id,
             )
             return
-
         # Release exactly the groups the prefetch locked (std lookup: all;
         # CB prefix leg: its prefix set) -- releasing an unlocked group
         # would drop another request's lock on the shared object key.
-        obj_keys = resolve_prefetched_obj_keys(
-            self._ctx, key, hit_chunks, session.prefetch_locked_gids
-        )
+        lookup_key = session.lookup_ipc_key
+        lock_floor = lookup_key.start if lookup_key is not None else 0
+        obj_keys: list[ObjectKey] = []
+        if key.start < key.end:
+            # The lookup never locked below its own ``start``.
+            obj_keys.extend(
+                resolve_prefetched_obj_keys(
+                    self._ctx,
+                    replace(key, start=max(key.start, lock_floor)),
+                    hit_chunks,
+                    session.prefetch_locked_gids,
+                )
+            )
+        for range_start, range_end in extra_ranges:
+            if range_start >= range_end:
+                continue
+            # An abandoned lookup's range ends at its hit boundary, so the
+            # range is its own lock model: resolve with that hit, not the
+            # current lookup's.
+            obj_keys.extend(
+                resolve_prefetched_obj_keys(
+                    self._ctx,
+                    replace(key, start=range_start, end=range_end),
+                    range_end // self._ctx.chunk_size,
+                    session.prefetch_locked_gids,
+                )
+            )
         if not obj_keys:
             return
 
@@ -494,7 +517,7 @@ class LookupModule:
         # TODO(chunxiaozheng): when l2 is enabled, the prefetched keys from l2 are temp
         #  and will be deleted after finish_read_prefetched, when we touch all keys,
         #  these keys has been deleted and will not be touched.
-        self._ctx.storage_manager.touch_l1_keys(obj_keys)
+        self._ctx.storage_manager.touch_cached_keys(obj_keys)
 
     # -----------------------------------------------------------------
     # Internal helpers
@@ -528,6 +551,48 @@ class LookupModule:
         with self._prefetch_job_lock:
             self._prefetch_jobs[job.request_id] = job
 
+    def _register_empty_prefetch_job(
+        self,
+        key: IPCCacheServerKey,
+        requested_tokens: int = 0,
+        num_object_groups: int = 1,
+        attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
+        start_chunk: int = 0,
+        early_exit_reason: str = "",
+    ) -> None:
+        """Register a job that resolves immediately without a prefetch.
+
+        Args:
+            key: The lookup's cache key.
+            requested_tokens: Hit-rate denominator tokens; 0 on early exits.
+            num_object_groups: Object groups of the request's layout.
+            attn_desc: The request's attention window descriptor.
+            start_chunk: First chunk of the looked-up range; reported as the
+                hit when everything below it is engine-covered.
+            early_exit_reason: The ``lookup()`` branch that returned before
+                submitting a prefetch; empty when the lookup simply had
+                nothing to fetch.
+        """
+        self._register_prefetch_job(
+            _PrefetchJob(
+                handle=PrefetchHandle(
+                    prefetch_request_id=-1,
+                    external_request_id=key.request_id,
+                    total_requested_keys=0,
+                    submit_time=time.monotonic(),
+                ),
+                row_windows=(),
+                request_id=key.request_id,
+                requested_tokens=requested_tokens,
+                num_object_groups=num_object_groups,
+                attn_desc=attn_desc,
+                start_chunk=start_chunk,
+                model_name=key.model_name,
+                cache_salt=key.cache_salt,
+                early_exit_reason=early_exit_reason,
+            )
+        )
+
     def _consume_prefetch_result(self, job: _PrefetchJob) -> int | None:
         """Hand a finished prefetch result over to the request's session.
 
@@ -557,6 +622,10 @@ class LookupModule:
             found_count = 0
             l1_found_count = 0
 
+        # The fold covers only the looked-up sub-range; shift back to absolute.
+        found_count += job.start_chunk
+        l1_found_count += job.start_chunk
+
         # Record the model-wide hit length on the session so a later
         # free_lookup_locks can reconstruct which keys the prefetch
         # read-locked (see ``unfold``: full-attention groups lock the whole
@@ -579,6 +648,8 @@ class LookupModule:
                 metadata={
                     "found_count": found_count,
                     "requested_tokens": job.requested_tokens,
+                    # Folded into the *_tokens counts but not the *_keys ones.
+                    "start_chunk": job.start_chunk,
                     "hit_tokens": found_count * self._ctx.chunk_size,
                     "l1_hit_tokens": l1_chunks * self._ctx.chunk_size,
                     "l2_hit_tokens": l2_chunks * self._ctx.chunk_size,
